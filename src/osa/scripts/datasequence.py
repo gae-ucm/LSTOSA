@@ -9,9 +9,11 @@ from osa.configs.config import cfg
 from osa.job import historylevel
 from osa.workflow.stages import AnalysisStage
 from osa.provenance.capture import trace
+from osa.paths import get_catB_calibration_filename
 from osa.utils.cliopts import data_sequence_cli_parsing
 from osa.utils.logging import myLogger
 from osa.utils.utils import date_to_dir
+from osa.paths import catB_closed_file_exists
 
 __all__ = ["data_sequence", "r0_to_dl1", "dl1_to_dl2", "dl1ab", "dl1_datacheck"]
 
@@ -27,6 +29,10 @@ def data_sequence(
     run_summary: Path,
     pedestal_ids_file: Path,
     run_str: str,
+    rf_model_path: Path,
+    dl1b_config: Path,
+    dl1_prod_id: str,
+    dl2_prod_id: str,
 ):
     """
     Performs all the steps to process a whole run.
@@ -68,16 +74,20 @@ def data_sequence(
         log.info(f"Going to level {level}")
 
     if level == 3:
-        rc = dl1ab(run_str)
-        if cfg.getboolean("lstchain", "store_image_dl1ab"):
-            level -= 1
-            log.info(f"Going to level {level}")
+        if options.no_dl1ab:
+            level = 0
+            log.info(f"No DL1B are going to be produced. Going to level {level}")
         else:
-            level -= 2
-            log.info(f"No images stored in dl1ab. Producing DL2. Going to level {level}")
+            rc = dl1ab(run_str, dl1b_config, dl1_prod_id)
+            if cfg.getboolean("lstchain", "store_image_dl1ab"):
+                level -= 1
+                log.info(f"Going to level {level}")
+            else:
+                level -= 2
+                log.info(f"No images stored in dl1ab. Producing DL2. Going to level {level}")
 
     if level == 2:
-        rc = dl1_datacheck(run_str)
+        rc = dl1_datacheck(run_str, dl1_prod_id)
         if options.no_dl2:
             level = 0
             log.info(f"No DL2 are going to be produced. Going to level {level}")
@@ -90,7 +100,7 @@ def data_sequence(
             level = 0
             log.info(f"No DL2 are going to be produced. Going to level {level}")
         else:
-            rc = dl1_to_dl2(run_str)
+            rc = dl1_to_dl2(run_str, rf_model_path, dl1_prod_id, dl2_prod_id)
             level -= 1
             log.info(f"Going to level {level}")
 
@@ -166,7 +176,7 @@ def r0_to_dl1(
 
 
 @trace
-def dl1ab(run_str: str) -> int:
+def dl1ab(run_str: str, dl1b_config: Path, dl1_prod_id: str) -> int:
     """
     Prepare and launch the actual lstchain script that is performing
     the image cleaning considering the interleaved pedestal information
@@ -181,25 +191,38 @@ def dl1ab(run_str: str) -> int:
     rc: int
         Return code of the executed command.
     """
+    
+    # Prepare and launch the actual lstchain script
+    command = cfg.get("lstchain", "dl1ab")
+    
     # Create a new subdirectory for the dl1ab output
-    dl1ab_subdirectory = Path(options.directory) / options.dl1_prod_id
+    dl1ab_subdirectory = Path(options.directory) / dl1_prod_id
     dl1ab_subdirectory.mkdir(parents=True, exist_ok=True)
-    dl1b_config = Path(cfg.get("lstchain", "dl1b_config"))
     # DL1a input file from base running_analysis directory
     input_dl1_datafile = Path(options.directory) / f"dl1_LST-1.Run{run_str}.h5"
     # DL1b output file to be stored in the dl1ab subdirectory
     output_dl1_datafile = dl1ab_subdirectory / f"dl1_LST-1.Run{run_str}.h5"
 
-    # Prepare and launch the actual lstchain script
-    command = cfg.get("lstchain", "dl1ab")
     cmd = [
         command,
         f"--input-file={input_dl1_datafile}",
         f"--output-file={output_dl1_datafile}",
         f"--config={dl1b_config}",
     ]
+    
     if not cfg.getboolean("lstchain", "store_image_dl1ab"):
         cmd.append("--no-image=True")
+
+    if cfg.getboolean("lstchain", "apply_catB_calibration"):
+        if catB_closed_file_exists(int(run_str[:5])):
+            catB_calibration_file = get_catB_calibration_filename(int(run_str[:5]))
+            cmd.append(f"--catB-calibration-file={catB_calibration_file}")
+        else:
+            log.info(
+                f"Cat-B calibration did not finish yet for run {run_str[:5]}. "
+                "Please try again later."
+            )
+            sys.exit(1)
 
     if options.simulate:
         return 0
@@ -210,7 +233,7 @@ def dl1ab(run_str: str) -> int:
 
 
 @trace
-def dl1_datacheck(run_str: str) -> int:
+def dl1_datacheck(run_str: str, dl1_prod_id: str) -> int:
     """
     Run datacheck script
 
@@ -223,9 +246,9 @@ def dl1_datacheck(run_str: str) -> int:
     rc: int
     """
     # Create a new subdirectory for the dl1ab output
-    dl1ab_subdirectory = Path(options.directory) / options.dl1_prod_id
+    dl1ab_subdirectory = Path(options.directory) / dl1_prod_id
     input_dl1_datafile = dl1ab_subdirectory / f"dl1_LST-1.Run{run_str}.h5"
-    output_directory = Path(options.directory) / options.dl1_prod_id
+    output_directory = Path(options.directory) / dl1_prod_id
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Prepare and launch the actual lstchain script
@@ -248,7 +271,7 @@ def dl1_datacheck(run_str: str) -> int:
 
 
 @trace
-def dl1_to_dl2(run_str: str) -> int:
+def dl1_to_dl2(run_str: str, rf_model_path: Path, dl1_prod_id: str, dl2_prod_id: str) -> int:
     """
     It prepares and execute the dl1 to dl2 lstchain scripts that applies
     the already trained RFs models to DL1 files. It identifies the
@@ -262,18 +285,22 @@ def dl1_to_dl2(run_str: str) -> int:
     -------
     rc: int
     """
-    dl1ab_subdirectory = Path(options.directory) / options.dl1_prod_id
-    dl2_subdirectory = Path(options.directory) / options.dl2_prod_id
+    dl2_subdirectory = Path(options.directory) / dl2_prod_id
+    dl2_file = dl2_subdirectory / f"dl2_LST-1.Run{run_str}.h5"
     dl2_config = Path(cfg.get("lstchain", "dl2_config"))
-    rf_models_directory = Path(cfg.get("lstchain", "RF_MODELS"))
+    dl1ab_subdirectory = Path(options.directory) / dl1_prod_id
     dl1_file = dl1ab_subdirectory / f"dl1_LST-1.Run{run_str}.h5"
+
+    if dl2_file.exists():
+        log.debug(f"The dl2 file {dl2_file} already exists.")
+        return 0
 
     command = cfg.get("lstchain", "dl1_to_dl2")
     cmd = [
         command,
         f"--input-file={dl1_file}",
         f"--output-dir={dl2_subdirectory}",
-        f"--path-models={rf_models_directory}",
+        f"--path-models={rf_model_path}",
         f"--config={dl2_config}",
     ]
 
@@ -296,6 +323,10 @@ def main():
         run_summary_file,
         pedestal_ids_file,
         run_number,
+        rf_model_path,
+        dl1b_config,
+        dl1_prod_id,
+        dl2_prod_id,
     ) = data_sequence_cli_parsing()
 
     if options.verbose:
@@ -313,6 +344,10 @@ def main():
         run_summary_file,
         pedestal_ids_file,
         run_number,
+        rf_model_path,
+        dl1b_config,
+        dl1_prod_id,
+        dl2_prod_id,
     )
     sys.exit(rc)
 
